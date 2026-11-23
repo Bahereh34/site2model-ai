@@ -8,6 +8,14 @@ import './style.css';
 
 const DEFAULT_ADDRESS = 'University of Maryland, College Park';
 
+async function readApiResponse(response) {
+  const body = await response.text();
+  let data = null;
+  try { data = body ? JSON.parse(body) : null; } catch { /* handled below with a useful status */ }
+  if (!data) throw new Error(`Server returned an empty or non-JSON response (HTTP ${response.status})${body ? `: ${body.slice(0,180)}` : '. Restart the backend if this endpoint was added recently.'}`);
+  return data;
+}
+
 function terrainHeight(terrain, east, north) {
   if (!terrain || terrain.status === 'disabled') return 0;
   const { n, radius_m: r, elevations_m: h } = terrain;
@@ -63,7 +71,15 @@ function Building({ building, terrain, heightFallback, selected, onSelect }) {
 function Roads({ roads, terrain }) {
   return <group>{roads.map((road) => {
     const positions = road.path.map(([x,north])=>[x, terrainHeight(terrain,x,north)+0.65, -north]);
-    return positions.length > 1 ? <Line key={road.id} points={positions} color="#677b87" lineWidth={road.type === 'footway' || road.type === 'path' ? 1.2 : 2.8} /> : null;
+    if (positions.length < 2) return null;
+    const pedestrian = ['footway','path','pedestrian','steps','cycleway','bridleway'].includes(road.type);
+    const major = ['motorway','trunk','primary','secondary'].includes(road.type);
+    const quality = ['excellent','good','intermediate'].includes(road.smoothness) || ['asphalt','concrete','paving_stones'].includes(road.surface);
+    const color = pedestrian ? (quality ? '#d79c55' : '#b77b5b') : major ? '#465b68' : quality ? '#718894' : '#9b8f83';
+    const width = pedestrian ? 1.7 : major ? 4.2 : 2.8;
+    return <group key={road.id}><Line points={positions} color={color} lineWidth={width} dashed={pedestrian && !quality} dashSize={3} gapSize={2} />
+      {!pedestrian && road.sidewalk !== 'no' && <Line points={positions} color="#d4c7a7" lineWidth={0.8} transparent opacity={.8} />}
+    </group>;
   })}</group>;
 }
 
@@ -77,6 +93,36 @@ function solarColor(value) {
   const color = new THREE.Color();
   color.setHSL(0.68 - Math.max(0, Math.min(1, value)) * 0.68, 0.85, 0.52);
   return color;
+}
+
+function solarPosition(latitude, hour, date = new Date()) {
+  const start = new Date(date.getFullYear(), 0, 0);
+  const day = Math.floor((date - start) / 86400000);
+  const declination = 23.44 * Math.sin((2 * Math.PI * (day - 81)) / 365) * Math.PI / 180;
+  const lat = latitude * Math.PI / 180;
+  const hourAngle = (hour - 12) * 15 * Math.PI / 180;
+  const altitude = Math.asin(Math.sin(lat)*Math.sin(declination) + Math.cos(lat)*Math.cos(declination)*Math.cos(hourAngle));
+  const azimuth = Math.atan2(Math.sin(hourAngle), Math.cos(hourAngle)*Math.sin(lat) - Math.tan(declination)*Math.cos(lat)) + Math.PI;
+  return { altitude, azimuth };
+}
+
+function SunPath({ model, visible, hour }) {
+  const path = useMemo(() => {
+    if (!model?.location) return null;
+    const radius = model.location.radius_m || 500;
+    const points = [];
+    for (let h=4; h<=20; h+=.25) {
+      const sun = solarPosition(model.location.lat, h);
+      const horizontal = Math.cos(sun.altitude) * radius * .72;
+      points.push([Math.sin(sun.azimuth)*horizontal, Math.max(2, Math.sin(sun.altitude)*radius*.62+3), -Math.cos(sun.azimuth)*horizontal]);
+    }
+    const current = solarPosition(model.location.lat, hour);
+    const horizontal = Math.cos(current.altitude) * radius * .72;
+    const marker = [Math.sin(current.azimuth)*horizontal, Math.max(2, Math.sin(current.altitude)*radius*.62+3), -Math.cos(current.azimuth)*horizontal];
+    return {points, marker};
+  }, [model, hour]);
+  if (!visible || !path) return null;
+  return <group><Line points={path.points} color="#f2a33b" lineWidth={2.5} transparent opacity={.85}/><mesh position={path.marker}><sphereGeometry args={[8,16,12]}/><meshBasicMaterial color="#ffd35a"/></mesh></group>;
 }
 
 function SolarHeatmap({ radius, visible, hour }) {
@@ -99,6 +145,29 @@ function SolarHeatmap({ radius, visible, hour }) {
     <planeGeometry args={[cell*1.02,cell*1.02]}/>
     <meshBasicMaterial color={solarColor(item.value)} transparent opacity={.32} depthWrite={false}/>
   </mesh>)}</group>;
+}
+
+function FocusedSolarHeatmap({ result, visible }) {
+  if (!visible || !result?.solar?.cells?.length) return null;
+  const bounds = result.bounds_m;
+  const count = result.grid_size;
+  const cellW = (bounds.max_east - bounds.min_east) / count;
+  const cellD = (bounds.max_north - bounds.min_north) / count;
+  return <group>{result.solar.cells.map((cell, index) => <mesh key={index} position={[cell.east_m, .42, -cell.north_m]} rotation={[-Math.PI/2,0,0]}>
+    <planeGeometry args={[cellW*1.03, cellD*1.03]}/><meshBasicMaterial color={solarColor(Math.min(1, cell.solar_w_m2/1000))} transparent opacity={.62} depthWrite={false}/>
+  </mesh>)}</group>;
+}
+
+function AreaDrawingSurface({ radius, drawing, points, onAddPoint }) {
+  const outline = points.map(([east, north]) => [east, .7, -north]);
+  if (!drawing) return null;
+  return <group>
+    <mesh rotation={[-Math.PI/2,0,0]} position={[0,.5,0]} onPointerDown={event => { event.stopPropagation(); if (event.button === 0) onAddPoint([Number(event.point.x.toFixed(2)), Number((-event.point.z).toFixed(2))]); }}>
+      <planeGeometry args={[radius*2, radius*2]}/><meshBasicMaterial transparent opacity={0} depthWrite={false}/>
+    </mesh>
+    {outline.length > 1 && <Line points={[...outline, outline[0]]} color="#ef8e3d" lineWidth={3}/>} 
+    {outline.map((point, index) => <mesh key={index} position={point}><sphereGeometry args={[4,12,8]}/><meshBasicMaterial color="#ef8e3d"/></mesh>)}
+  </group>;
 }
 
 function WindArrows({ radius, visible, direction }) {
@@ -200,8 +269,9 @@ function AnchoredFacade({ building, result, terrain, fallbackHeight, reliefMeter
   </mesh>;
 }
 
-function Scene({ model, layers, analysisLayers, solarHour, windDirection, unknownHeight, onSelect, selected, sceneRef, facade, panelRef }) {
+function Scene({ model, layers, analysisLayers, solarHour, windDirection, unknownHeight, onSelect, selected, sceneRef, facade, panelRef, focusedAnalysis, drawingArea, drawingPoints, onAddAreaPoint }) {
   const radius = model?.location.radius_m || 500;
+  const actualWindDirection = model?.wind?.direction_deg ?? windDirection;
   return <Canvas shadows camera={{ position: [radius*0.98, radius*0.95, radius*1.22], fov: 50, near: 0.1, far: 15000 }} onPointerMissed={()=>onSelect(null)}>
     <color attach="background" args={['#dbe6e9']}/>
     <ambientLight intensity={1.4}/><directionalLight position={[250,450,150]} intensity={2.4} castShadow shadow-mapSize={[2048,2048]}/>
@@ -209,7 +279,10 @@ function Scene({ model, layers, analysisLayers, solarHour, windDirection, unknow
       {model && <>
         <Terrain data={model.terrain} visible={layers.terrain}/>
         <SolarHeatmap radius={radius} visible={analysisLayers.solar} hour={solarHour}/>
-        <WindArrows radius={radius} visible={analysisLayers.wind} direction={windDirection}/>
+        <FocusedSolarHeatmap result={focusedAnalysis} visible={analysisLayers.solar}/>
+        <AreaDrawingSurface radius={radius} drawing={drawingArea} points={drawingPoints} onAddPoint={onAddAreaPoint}/>
+        <SunPath model={model} visible={analysisLayers.solar} hour={solarHour}/>
+        <WindArrows radius={radius} visible={analysisLayers.wind} direction={actualWindDirection}/>
         <ShadowOverlay model={model} visible={analysisLayers.shadows} hour={solarHour} unknownHeight={unknownHeight}/>
         {layers.roads && <Roads roads={model.roads} terrain={model.terrain}/>}
         {layers.buildings && model.buildings.map((b)=><Building key={b.id} building={b} terrain={model.terrain} heightFallback={unknownHeight} selected={selected?.id===b.id} onSelect={onSelect}/>)}
@@ -293,7 +366,18 @@ function App() {
   const [facadeBuildingId,setFacadeBuildingId]=useState(null);
   const [facadeRelief,setFacadeRelief]=useState(0.35);
   const [facadeMethod,setFacadeMethod]=useState('relief');
-  const [analysisResult]=useState(null);
+  const [analysisResult,setAnalysisResult]=useState(null);
+  const [weatherResult,setWeatherResult]=useState(null);
+  const [epwFile,setEpwFile]=useState(null);
+  const [focusScope,setFocusScope]=useState('all');
+  const [focusBuildingIds,setFocusBuildingIds]=useState([]);
+  const [focusWidth,setFocusWidth]=useState(100);
+  const [focusDepth,setFocusDepth]=useState(100);
+  const [focusEast,setFocusEast]=useState(0);
+  const [focusNorth,setFocusNorth]=useState(0);
+  const [focusedAnalysis,setFocusedAnalysis]=useState(null);
+  const [drawingArea,setDrawingArea]=useState(false);
+  const [drawingPoints,setDrawingPoints]=useState([]);
   const panelRef=useRef();
 
   const [unknownHeight,setUnknownHeight]=useState(10);
@@ -325,7 +409,7 @@ function App() {
     try{
       const file=photoFiles[activePhoto];
       const response=await fetch(`/api/image-to-3d?method=${facadeMethod}`,{method:'POST',headers:{'Content-Type':file.type},body:file});
-      const data=await response.json();
+      const data=await readApiResponse(response);
       if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:`HTTP ${response.status}`);
       setFacadeResult(data);setFacadeBuildingId(selected.id);setViewMode('massing');
     }catch(err){setError(err.message||'Façade processing failed');}
@@ -337,11 +421,60 @@ function App() {
     event.preventDefault(); setLoading(true);setError('');setSelected(null);setFacadeBuildingId(null);setFacadeResult(null);
     try {
       const response=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address,radius_m:radius, ...layers})});
-      const data=await response.json();
+      const data=await readApiResponse(response);
       if(!response.ok) throw new Error(typeof data.detail==='string'?data.detail:`HTTP ${response.status}`);
-      setModel(data); setGeneratedFor(address);
+      setModel(data); setGeneratedFor(address); setAnalysisResult(null); setFocusedAnalysis(null); setFocusBuildingIds([]);
+      setWeatherResult(null);
+      if (data.wind?.status === 'available') setWindDirection(data.wind.direction_deg);
     } catch (err) {setError(err.message || 'Unable to load site');}
     finally {setLoading(false);}
+  }
+  async function runValidatedAnalysis() {
+    if (!model) { setError('Generate the address-based site model first.'); return; }
+    setLoading(true); setError('');
+    try {
+      const response = await fetch('/api/simulate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model, weather_file:weatherResult?.filename || null, run_energyplus:true, run_radiance:true, solar_hour:solarHour})});
+      const data = await readApiResponse(response);
+      if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `HTTP ${response.status}`);
+      setAnalysisResult(data);
+    } catch (e) { setError(e.message || 'Validated simulation failed'); }
+    finally { setLoading(false); }
+  }
+  async function downloadWeather() {
+    if (!model) { setError('Generate the address-based site model first.'); return; }
+    setLoading(true); setError('');
+    try {
+      const response = await fetch('/api/weather/download', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({latitude:model.location.lat, longitude:model.location.lon, label:model.location.address})});
+      const data = await readApiResponse(response);
+      if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `HTTP ${response.status}`);
+      setWeatherResult(data);
+    } catch (e) { setError(e.message || 'EPW download failed'); }
+    finally { setLoading(false); }
+  }
+  function openWeatherMap() {
+    window.open('https://www.ladybug.tools/epwmap/', '_blank', 'noopener,noreferrer');
+  }
+  async function uploadWeather() {
+    if (!epwFile) { setError('Choose the .epw file you downloaded from EPWMap first.'); return; }
+    setLoading(true); setError('');
+    try {
+      const response = await fetch(`/api/weather/upload?filename=${encodeURIComponent(epwFile.name)}`, {method:'PUT', headers:{'Content-Type':'application/octet-stream'}, body:epwFile});
+      const data = await readApiResponse(response);
+      if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `HTTP ${response.status}`);
+      setWeatherResult(data);
+    } catch (e) { setError(e.message || 'EPW upload failed'); }
+    finally { setLoading(false); }
+  }
+  async function runFocusedAnalysis() {
+    if (!model) { setError('Generate the address-based site model first.'); return; }
+    setLoading(true); setError('');
+    try {
+      const response = await fetch('/api/analyze-focused', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model, scope:focusScope, building_ids:focusBuildingIds, center_east_m:Number(focusEast), center_north_m:Number(focusNorth), width_m:Number(focusWidth), depth_m:Number(focusDepth), polygon:drawingPoints, grid_size:focusScope === 'all' ? 18 : 28, solar_hour:solarHour})});
+      const data = await readApiResponse(response);
+      if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `HTTP ${response.status}`);
+      setFocusedAnalysis(data);
+    } catch (e) { setError(e.message || 'Focused analysis failed'); }
+    finally { setLoading(false); }
   }
   async function generateImage(event) {
     event.preventDefault();setError('');
@@ -351,7 +484,7 @@ function App() {
       const response=await fetch(`/api/image-to-3d?method=${imageMethod}`,{
         method:'POST',headers:{'Content-Type':imageFile.type},body:imageFile
       });
-      const data=await response.json();
+      const data=await readApiResponse(response);
       if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:`HTTP ${response.status}`);
       setImageResult(data);setViewMode('image');
     } catch(e){setError(e.message||'Image conversion failed');}
@@ -392,11 +525,27 @@ function App() {
         <label>MODEL LAYERS</label><div className="layerList">{Object.entries(layers).map(([name,enabled])=><label className="layer" key={name}><input type="checkbox" checked={enabled} onChange={()=>toggle(name)}/><span>{name[0].toUpperCase()+name.slice(1)}</span></label>)}</div>
         <section className="siteAnalysisPanel">
           <h3>Site analysis</h3>
-          <p>Study solar exposure, prevailing wind, and approximate building shadows in the 3D context.</p>
+          <p>Preview layers are approximate. Run the installed EnergyPlus and Radiance engines for measured weather-file and ray-traced results.</p>
           <div className="layerList">{Object.entries(analysisLayers).map(([name,enabled])=><label className="layer" key={name}><input type="checkbox" checked={enabled} onChange={()=>toggleAnalysis(name)}/><span>{name === 'solar' ? 'Solar radiation' : name === 'wind' ? 'Wind direction' : 'Shadowing'}</span></label>)}</div>
           <label htmlFor="solarHour">SOLAR TIME: {solarHour}:00</label><input id="solarHour" type="range" min="6" max="18" step="1" value={solarHour} onChange={e=>setSolarHour(Number(e.target.value))}/>
           <label htmlFor="windDirection">WIND DIRECTION: {windDirection}°</label><input id="windDirection" type="range" min="0" max="359" step="1" value={windDirection} onChange={e=>setWindDirection(Number(e.target.value))}/>
+          {model?.wind && <p className="dataNote">{model.wind.status === 'available' ? `Live wind: ${model.wind.speed_kmh} km/h at 10 m · ${model.wind.observed_at || 'current'} · ${model.wind.source}` : model.wind.message}</p>}
+          <div className="focusAnalysis">
+            <h3>Focused analysis</h3>
+            <label htmlFor="focusScope">TARGET</label>
+            <select id="focusScope" value={focusScope} onChange={e=>setFocusScope(e.target.value)}><option value="all">Entire study area</option><option value="buildings">Selected buildings</option><option value="area">Custom area</option></select>
+            {focusScope === 'buildings' && <div className="buildingChoices">{model?.buildings?.slice(0,40).map(building=><label className="layer" key={building.id}><input type="checkbox" checked={focusBuildingIds.includes(building.id)} onChange={e=>setFocusBuildingIds(old=>e.target.checked?[...old,building.id]:old.filter(id=>id!==building.id))}/><span>{building.name || `Building ${building.id}`}</span></label>)}</div>}
+            {focusScope === 'area' && <div className="focusFields"><button type="button" className="secondary drawButton" onClick={()=>{setDrawingArea(true);setDrawingPoints([]);setFocusedAnalysis(null)}}>{drawingArea ? 'Click points in the scene…' : 'Draw polygon area'}</button><button type="button" className="secondary" onClick={()=>setDrawingPoints(old=>old.slice(0,-1))} disabled={!drawingPoints.length}>Undo point</button><button type="button" className="secondary" onClick={()=>{setDrawingPoints([]);setDrawingArea(false)}} disabled={!drawingPoints.length}>Clear polygon</button><span className="dataNote">{drawingPoints.length >= 3 ? `${drawingPoints.length} points ready` : 'Click at least 3 points on the 3D ground plane.'}</span></div>}
+            <button type="button" className="secondary" onClick={runFocusedAnalysis} disabled={loading || !model || (focusScope === 'area' && drawingPoints.length < 3)}>{loading ? 'Analyzing target…' : 'Analyze selected target'}</button>
+            {focusedAnalysis && <div className="analysisCard"><h3>Focused result</h3><div><span>Solar grid</span><b>{focusedAnalysis.grid_size} × {focusedAnalysis.grid_size}</b></div><div><span>Solar method</span><b>screening</b></div><div><span>CFD</span><b>{focusedAnalysis.cfd.status}</b></div><p className="methodNote">{focusedAnalysis.cfd.message}</p></div>}
+          </div>
           <div className="analysisLegend"><span>Low solar</span><i></i><span>High solar</span></div>
+          <button type="button" className="secondary" onClick={runValidatedAnalysis} disabled={loading || !model}>{loading ? 'Running engines…' : 'Run EnergyPlus + Radiance'}</button>
+          <button type="button" className="secondary" onClick={downloadWeather} disabled={loading || !model}>{loading ? 'Downloading weather…' : 'Download nearest Ladybug EPW'}</button>
+          {weatherResult?.status === 'downloaded' && <p className="dataNote">EPW ready: {weatherResult.station} · {weatherResult.distance_km} km away · {weatherResult.filename}</p>}
+          {weatherResult?.status === 'manual_required' && <div className="analysisCard"><p className="methodNote">{weatherResult.message}</p><p className="dataNote">Use the site coordinates in EPWMap: {weatherResult.latitude.toFixed(5)}, {weatherResult.longitude.toFixed(5)}.</p><button type="button" className="secondary" onClick={openWeatherMap}>Open Ladybug EPWMap</button></div>}
+          <div className="weatherUpload"><label htmlFor="epwFile">UPLOAD EPW FROM EPWMAP</label><input id="epwFile" type="file" accept=".epw,application/vnd.epw" onChange={e=>setEpwFile(e.target.files?.[0] || null)}/>{epwFile && weatherResult?.status !== 'uploaded' && <p className="dataNote">Selected: {epwFile.name}. Click “Use uploaded EPW” to send it to the backend.</p>}<button type="button" className="secondary" onClick={uploadWeather} disabled={loading || !epwFile}>{loading ? 'Uploading EPW…' : 'Use uploaded EPW'}</button>{weatherResult?.status === 'uploaded' && <div className="weatherSuccess" role="status"><strong>EPW ready</strong><span>{weatherResult.filename} uploaded successfully and ready for EnergyPlus and Radiance.</span></div>}</div>
+          {analysisResult && <div className="analysisCard"><h3>{analysisResult.status === 'completed' ? 'Validated engine run' : 'Engine run needs attention'}</h3><div><span>EnergyPlus</span><b>{analysisResult.energyplus?.status || 'not run'}</b></div><div><span>Radiance</span><b>{analysisResult.radiance?.status || 'not run'}</b></div><p className="methodNote">{analysisResult.energyplus?.message || analysisResult.radiance?.message || 'Results were produced by the configured local engines.'}</p></div>}
         </section>
         <label htmlFor="height">UNKNOWN BUILDING HEIGHT: {unknownHeight} m</label><input id="height" type="range" min="3" max="35" step="1" value={unknownHeight} onChange={e=>setUnknownHeight(Number(e.target.value))}/>
         <button className="primary" type="submit" disabled={loading}>{loading?'Retrieving geodata…':'1. Generate 3D site →'}</button>
@@ -431,7 +580,7 @@ function App() {
       <header><div><strong>3D Site Explorer</strong><span>{model ? model.location.address : 'Address or image · 3D'}</span></div><span className="live">{viewMode==='image'?(imageResult?'● IMAGE MESH READY':'○ IMAGE MODE'):(model?'● REAL GEODATA':'○ READY TO GENERATE')}</span></header>
         <button type="button" className={viewMode==='massing'?'active':''} onClick={()=>{setViewMode('massing');setSourceMode('address');}}>Urban context + façade</button>
       <div className="viewer">
-        {viewMode==='massing' ? <Scene model={model} layers={layers} analysisLayers={analysisLayers} solarHour={solarHour} windDirection={windDirection} unknownHeight={unknownHeight} selected={selected} onSelect={setSelected} sceneRef={sceneRef} facade={facadeResult ? {buildingId:facadeBuildingId,result:facadeResult,reliefMeters:facadeRelief}:null} panelRef={panelRef}/> : <ImageScene result={imageResult} depthScale={depthScale} meshRef={imageMeshRef}/>}
+        {viewMode==='massing' ? <Scene model={model} layers={layers} analysisLayers={analysisLayers} solarHour={solarHour} windDirection={windDirection} unknownHeight={unknownHeight} selected={selected} onSelect={setSelected} sceneRef={sceneRef} facade={facadeResult ? {buildingId:facadeBuildingId,result:facadeResult,reliefMeters:facadeRelief}:null} panelRef={panelRef} focusedAnalysis={focusedAnalysis} drawingArea={drawingArea} drawingPoints={drawingPoints} onAddAreaPoint={point=>setDrawingPoints(old=>[...old,point])}/> : <ImageScene result={imageResult} depthScale={depthScale} meshRef={imageMeshRef}/>}
         {viewMode === 'massing' && !model && <div className="prompt"><span>◈</span><h2>Your site, in three dimensions.</h2><p>Enter an address to generate real-data urban context.</p></div>}
         {viewMode === 'image' && !imageResult && <div className="prompt"><span>◈</span><h2>Photo to interactive 3D.</h2><p>Upload your own building photograph, then select quick relief or AI depth estimation.</p></div>}
         {viewMode === 'massing' && selected && <div className="selection"><button className="close" onClick={()=>setSelected(null)}>×</button><b>{selected.name||`OSM building ${selected.id}`}</b><div>Height: {selected.height_m===null?`${unknownHeight} m (visual assumption)`:`${selected.height_m.toFixed(1)} m`}</div><small>Source: {selected.height_source.replaceAll('_',' ')}</small></div>}

@@ -7,7 +7,13 @@ import json
 from pathlib import Path
 import os
 import re
+import csv
+import shutil
+import subprocess
+import tempfile
 import time
+import io
+import zipfile
 import xml.etree.ElementTree as ET
 from threading import Lock
 from dotenv import load_dotenv
@@ -63,6 +69,39 @@ class GenerateRequest(BaseModel):
     buildings: bool = True
     roads: bool = True
     terrain: bool = True
+
+
+class SimulationRequest(BaseModel):
+    """Inputs for a real, server-side engine run.
+
+    The geometry is intentionally accepted from the generated model rather
+    than rebuilt from an address so that the run is reproducible and can be
+    exported with the exact inputs used by the engines.
+    """
+    model: dict[str, Any]
+    weather_file: str | None = Field(default=None, max_length=260)
+    run_energyplus: bool = True
+    run_radiance: bool = True
+    solar_hour: int = Field(default=12, ge=6, le=18)
+
+
+class FocusAnalysisRequest(BaseModel):
+    model: dict[str, Any]
+    scope: Literal["all", "buildings", "area"] = "all"
+    building_ids: list[str | int] = Field(default_factory=list, max_length=50)
+    center_east_m: float = Field(default=0, ge=-1000, le=1000)
+    center_north_m: float = Field(default=0, ge=-1000, le=1000)
+    width_m: float = Field(default=100, ge=10, le=1000)
+    depth_m: float = Field(default=100, ge=10, le=1000)
+    polygon: list[list[float]] = Field(default_factory=list, max_length=100)
+    grid_size: int = Field(default=18, ge=8, le=50)
+    solar_hour: int = Field(default=12, ge=6, le=18)
+
+
+class WeatherDownloadRequest(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    label: str = Field(default="site", min_length=1, max_length=120)
 
 
 class ArchitectureEstimate(BaseModel):
@@ -361,7 +400,7 @@ def parse_osm(elements: list[dict], transformer: Transformer, origin_x: float, o
                 "material": str(tags.get("building:material", "")).strip().lower() or None,
             })
         if "highway" in tags:
-            roads.append({"id": el.get("id"), "type": tags["highway"], "name": tags.get("name", ""), "path": points})
+            roads.append({"id": el.get("id"), "type": tags["highway"], "name": tags.get("name", ""), "surface": tags.get("surface", "unknown"), "smoothness": tags.get("smoothness", "unknown"), "lit": tags.get("lit", "unknown"), "lanes": tags.get("lanes"), "sidewalk": tags.get("sidewalk", "unknown"), "path": points})
     return buildings, roads
 
 
@@ -391,9 +430,357 @@ def terrain_grid(lat: float, lon: float, radius: int, transformer: Transformer, 
         return {"status": "flat_fallback", "resolution_note": "Elevation unavailable; displayed plane is NOT real topography", "n": n, "radius_m": radius, "elevations_m": [0.0] * n * n, "datum_min_m": None}
 
 
+def current_wind(lat: float, lon: float) -> dict[str, Any]:
+    """Get current location-based wind from Open-Meteo, with provenance."""
+    url = os.getenv("WEATHER_API_URL", "https://api.open-meteo.com/v1/forecast")
+    try:
+        with httpx.Client(timeout=12, headers={"User-Agent": USER_AGENT}) as client:
+            response = client.get(url, params={
+                "latitude": lat, "longitude": lon,
+                "current": "wind_direction_10m,wind_speed_10m",
+                "wind_speed_unit": "kmh", "timezone": "auto",
+            })
+            response.raise_for_status()
+            current = response.json().get("current") or {}
+        direction = current.get("wind_direction_10m")
+        speed = current.get("wind_speed_10m")
+        if direction is None or speed is None:
+            raise ValueError("wind fields missing")
+        return {"status": "available", "direction_deg": round(float(direction), 1), "speed_kmh": round(float(speed), 1), "observed_at": current.get("time"), "height_m": 10, "source": "Open-Meteo current forecast; 10 m wind"}
+    except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
+        return {"status": "unavailable", "message": f"Live wind data unavailable: {str(exc)[:160]}", "source": "Open-Meteo"}
+
+
+def _focused_bounds(req: FocusAnalysisRequest) -> tuple[float, float, float, float, list[dict[str, Any]]]:
+    buildings = req.model.get("buildings") or []
+    if req.scope == "buildings":
+        wanted = {str(value) for value in req.building_ids}
+        target = [b for b in buildings if str(b.get("id")) in wanted]
+        if not target:
+            raise HTTPException(422, "Select at least one building for building analysis")
+        points = [point for b in target for point in b.get("outline", [])]
+        min_x, max_x = min(p[0] for p in points) - 8, max(p[0] for p in points) + 8
+        min_y, max_y = min(p[1] for p in points) - 8, max(p[1] for p in points) + 8
+        return min_x, max_x, min_y, max_y, target
+    if req.scope == "area":
+        if len(req.polygon) >= 3:
+            return (min(point[0] for point in req.polygon), max(point[0] for point in req.polygon), min(point[1] for point in req.polygon), max(point[1] for point in req.polygon), buildings)
+        return (req.center_east_m - req.width_m / 2, req.center_east_m + req.width_m / 2,
+                req.center_north_m - req.depth_m / 2, req.center_north_m + req.depth_m / 2, buildings)
+    points = [point for b in buildings for point in b.get("outline", [])]
+    radius = float((req.model.get("location") or {}).get("radius_m", 500))
+    if not points:
+        return -radius, radius, -radius, radius, buildings
+    return min(p[0] for p in points), max(p[0] for p in points), min(p[1] for p in points), max(p[1] for p in points), buildings
+
+
+def _focused_solar(lat: float, hour: int, east: float, north: float, buildings: list[dict[str, Any]]) -> float:
+    # Clear-sky horizontal irradiance estimate, with footprint-aware shadow attenuation.
+    day = time.gmtime().tm_yday
+    declination = math.radians(23.44 * math.sin(2 * math.pi * (day - 81) / 365))
+    latitude = math.radians(lat)
+    hour_angle = math.radians((hour - 12) * 15)
+    altitude = math.asin(math.sin(latitude) * math.sin(declination) + math.cos(latitude) * math.cos(declination) * math.cos(hour_angle))
+    if altitude <= 0:
+        return 0.0
+    direct = 1000 * math.sin(altitude) * (0.72 + 0.08 * math.sin(altitude))
+    shadow = 1.0
+    sun_azimuth = math.atan2(math.sin(hour_angle), math.cos(hour_angle) * math.sin(latitude) - math.tan(declination) * math.cos(latitude)) + math.pi
+    downwind_x, downwind_y = math.sin(sun_azimuth), math.cos(sun_azimuth)
+    shadow_length = 45 / max(math.tan(altitude), 0.25)
+    for building in buildings:
+        outline = building.get("outline") or []
+        if not outline:
+            continue
+        cx = sum(point[0] for point in outline) / len(outline)
+        cy = sum(point[1] for point in outline) / len(outline)
+        relative_x, relative_y = east - cx, north - cy
+        along = relative_x * downwind_x + relative_y * downwind_y
+        cross = abs(relative_x * downwind_y - relative_y * downwind_x)
+        height = float(building.get("height_m") or 10)
+        if 0 < along < height / max(math.tan(altitude), 0.2) + 8 and cross < max(6, height * 0.35):
+            shadow = min(shadow, 0.35)
+    return round(max(0, direct * shadow), 1)
+
+
+def _point_in_polygon(x: float, y: float, polygon: list[list[float]]) -> bool:
+    inside = False
+    for index, point in enumerate(polygon):
+        x1, y1 = point
+        x2, y2 = polygon[(index + 1) % len(polygon)]
+        if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / ((y2 - y1) or 1e-12) + x1:
+            inside = not inside
+    return inside
+
+
+@app.post("/api/analyze-focused")
+def analyze_focused(req: FocusAnalysisRequest):
+    if req.scope == "area" and req.polygon and len(req.polygon) < 3:
+        raise HTTPException(422, "A drawn area needs at least three points")
+    location = req.model.get("location") or {}
+    min_x, max_x, min_y, max_y, target = _focused_bounds(req)
+    size = req.grid_size
+    cells = []
+    for row in range(size):
+        for col in range(size):
+            east = min_x + (col + 0.5) * (max_x - min_x) / size
+            north = min_y + (row + 0.5) * (max_y - min_y) / size
+            if not req.polygon or _point_in_polygon(east, north, req.polygon):
+                cells.append({"east_m": round(east, 2), "north_m": round(north, 2), "solar_w_m2": _focused_solar(float(location.get("lat", 0)), req.solar_hour, east, north, target)})
+    wind = current_wind(float(location.get("lat", 0)), float(location.get("lon", 0)))
+    cfd = {"status": "screening", "method": "wind-vector screening from live 10 m weather; not CFD", "message": "Install and configure OpenFOAM or another CFD solver for pressure, turbulence, and recirculation results."}
+    return {"status": "completed", "scope": req.scope, "polygon": req.polygon, "selected_building_ids": [b.get("id") for b in target] if req.scope == "buildings" else [], "bounds_m": {"min_east": round(min_x, 2), "max_east": round(max_x, 2), "min_north": round(min_y, 2), "max_north": round(max_y, 2)}, "grid_size": size, "solar": {"method": "clear-sky solar geometry plus footprint shadow attenuation; use Radiance for validated ray tracing", "hour": req.solar_hour, "units": "W/m²", "cells": cells}, "wind": wind, "cfd": cfd}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+def _command_path(name: str, env_name: str) -> str | None:
+    configured = os.getenv(env_name, "").strip()
+    return configured if configured and Path(configured).exists() else shutil.which(name)
+
+
+def _weather_path(requested: str | None) -> Path | None:
+    """Resolve an explicit weather file, or the only EPW in the weather directory."""
+    weather_dir = _weather_directory()
+    value = (requested or os.getenv("DEFAULT_EPW_FILE", "")).strip()
+    if not value:
+        candidates = sorted(weather_dir.glob("*.epw"), key=lambda path: path.stat().st_mtime, reverse=True) if weather_dir.exists() else []
+        return candidates[0] if len(candidates) == 1 else None
+    candidate = Path(value)
+    candidate = candidate if candidate.is_absolute() else weather_dir / candidate.name
+    candidate = candidate.resolve()
+    try:
+        candidate.relative_to(weather_dir)
+    except ValueError:
+        raise HTTPException(422, "weather_file must be inside WEATHER_EPWS_DIR")
+    return candidate if candidate.is_file() and candidate.suffix.lower() == ".epw" else None
+
+
+def _weather_directory() -> Path:
+    configured = Path(os.getenv("WEATHER_EPWS_DIR", "weather"))
+    return (configured if configured.is_absolute() else BACKEND_DIR / configured).resolve()
+
+
+def _catalog_field(row: dict[str, str], names: tuple[str, ...]) -> str:
+    normalized = {str(key).strip().lower().replace(" ", "_"): value for key, value in row.items() if key}
+    for name in names:
+        if normalized.get(name):
+            return normalized[name].strip()
+    return ""
+
+
+def _download_epw_nearest(latitude: float, longitude: float, label: str) -> dict[str, Any]:
+    catalog_url = os.getenv("EPW_CATALOG_URL", "https://raw.githubusercontent.com/ladybug-tools/epwmap/gh-pages/data/epw_weather_data.csv")
+    try:
+        with httpx.Client(timeout=30, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+            response = client.get(catalog_url)
+            response.raise_for_status()
+            rows = csv.DictReader(io.StringIO(response.text))
+            stations = []
+            for row in rows:
+                try:
+                    lat = float(_catalog_field(row, ("latitude", "lat")))
+                    lon = float(_catalog_field(row, ("longitude", "lon", "lng")))
+                    url = _catalog_field(row, ("url", "weather_url", "epw_url", "zip_url", "file_url"))
+                    if not url:
+                        continue
+                    distance = math.hypot((lat - latitude) * 111.2, (lon - longitude) * 111.2 * math.cos(math.radians(latitude)))
+                    stations.append((distance, lat, lon, url, row))
+                except (TypeError, ValueError):
+                    continue
+            if not stations:
+                raise ValueError("EPW catalog contained no usable station coordinates")
+            distance, station_lat, station_lon, weather_url, station = min(stations, key=lambda item: item[0])
+            weather_response = client.get(weather_url)
+            weather_response.raise_for_status()
+        payload = weather_response.content
+        station_name = _catalog_field(station, ("city", "station", "name", "location")) or label
+        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", station_name).strip("_")[:80] or "site_weather"
+        weather_dir = _weather_directory()
+        weather_dir.mkdir(parents=True, exist_ok=True)
+        if weather_url.lower().split("?")[0].endswith(".epw"):
+            epw_name = safe_name + ".epw"
+            (weather_dir / epw_name).write_bytes(payload)
+        else:
+            with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                names = [name for name in archive.namelist() if name.lower().endswith(".epw") and not name.endswith("/")]
+                if not names:
+                    raise ValueError("Downloaded weather archive did not contain an EPW file")
+                epw_name = safe_name + ".epw"
+                (weather_dir / epw_name).write_bytes(archive.read(names[0]))
+        return {"status": "downloaded", "filename": epw_name, "station": station_name, "station_latitude": station_lat, "station_longitude": station_lon, "distance_km": round(distance, 1), "source": "Ladybug Tools EPWMap catalog", "source_url": weather_url}
+    except (httpx.HTTPError, OSError, ValueError, zipfile.BadZipFile, KeyError) as exc:
+        return {"status": "manual_required", "message": f"Automatic EPW catalog download is unavailable: {str(exc)[:180]}", "epwmap_url": "https://www.ladybug.tools/epwmap/", "latitude": latitude, "longitude": longitude, "source": "Ladybug Tools EPWMap"}
+
+
+def _idf_for_model(model: dict[str, Any], weather: Path, output: Path) -> Path:
+    """Create a small but valid EnergyPlus model from OSM footprints."""
+    output.mkdir(parents=True, exist_ok=True)
+    location = model.get("location") or {}
+    buildings = model.get("buildings") or []
+    lat = float(location.get("lat", 0))
+    lon = float(location.get("lon", 0))
+    lines = [
+        "Version,25.2;",
+        "Timestep,4;",
+        "Building,Site2Model,0.0,Suburbs,0.04,0.4,FullExterior,25;",
+        f"Site:Location,Site2Model,{lat},{lon},0.0,0.0;",
+        "SimulationControl,Yes,No,No,No,Yes;",
+        "GlobalGeometryRules,UpperLeftCorner,Counterclockwise,World;",
+        "RunPeriod,Annual,1,1,,12,31,,Tuesday,Yes,Yes,Yes,Yes,Yes;",
+        "Output:Variable,*,Zone Mean Air Temperature,Hourly;",
+        "Output:Variable,*,Zone Ideal Loads Zone Total Heating Energy,Hourly;",
+        "Output:Variable,*,Zone Ideal Loads Zone Total Cooling Energy,Hourly;",
+        "Output:Meter,Electricity:Facility,Hourly;",
+        "Material,Generic Wall,MediumRough,0.2,0.9,800,900,0.9,0.7,0.7;",
+        "Material,Generic Roof,MediumRough,0.2,0.9,800,900,0.9,0.7,0.7;",
+        "Construction,Generic Wall,Generic Wall;",
+        "Construction,Generic Roof,Generic Roof;",
+    ]
+    for index, building in enumerate(buildings[:100]):
+        outline = building.get("outline") or []
+        if len(outline) < 3:
+            continue
+        height = max(2.5, min(float(building.get("height_m") or 10), 100))
+        zone = f"OSM_Building_{index + 1}"
+        lines += [f"Zone,{zone},0,0,0,0,1,1,autocalculate,autocalculate,autocalculate;"]
+        for side, point in enumerate(outline):
+            next_point = outline[(side + 1) % len(outline)]
+            x1, y1 = float(point[0]), float(point[1])
+            x2, y2 = float(next_point[0]), float(next_point[1])
+            lines += [
+                f"BuildingSurface:Detailed,{zone}_Wall_{side},Wall,Generic Wall,{zone},,Outdoors,,SunExposed,WindExposed,0,4,{x1},{y1},0,{x2},{y2},0,{x2},{y2},{height},{x1},{y1},{height};"
+            ]
+        lines += [
+            f"BuildingSurface:Detailed,{zone}_Roof,Roof,Generic Roof,{zone},,Outdoors,,SunExposed,WindExposed,0,{len(outline)},"
+            + ",".join(f"{float(x)},{float(y)},{height}" for x, y in outline) + ";"
+        ]
+    idf = output / "site2model.idf"
+    idf.write_text("\n".join(lines), encoding="utf-8")
+    return idf
+
+
+def _run_energyplus(model: dict[str, Any], weather: Path, output: Path) -> dict[str, Any]:
+    binary = _command_path("energyplus", "ENERGYPLUS_BIN")
+    if not binary:
+        return {"status": "unavailable", "message": "EnergyPlus executable not found. Set ENERGYPLUS_BIN."}
+    idf = _idf_for_model(model, weather, output)
+    command = [binary, "-w", str(weather), "-d", str(output), str(idf)]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=int(os.getenv("SIMULATION_TIMEOUT_SECONDS", "300")), check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "failed", "message": f"EnergyPlus could not complete: {exc}"}
+    if completed.returncode != 0:
+        error_file = output / "eplusout.err"
+        engine_error = error_file.read_text(encoding="utf-8", errors="replace") if error_file.exists() else ""
+        return {"status": "failed", "message": (engine_error or completed.stderr or completed.stdout)[-2000:]}
+    result = {"status": "completed", "engine": "EnergyPlus", "annual": {}}
+    csv_path = output / "eplusout.csv"
+    if csv_path.exists():
+        with csv_path.open(newline="", encoding="utf-8", errors="replace") as handle:
+            rows = list(csv.DictReader(handle))
+        result["annual"]["hourly_records"] = len(rows)
+        result["annual"]["available_columns"] = list(rows[0]) if rows else []
+    return result
+
+
+def _run_radiance(model: dict[str, Any], output: Path, solar_hour: int) -> dict[str, Any]:
+    oconv = _command_path("oconv", "RADIANCE_OCONV_BIN")
+    rtrace = _command_path("rtrace", "RADIANCE_RTRACE_BIN")
+    gensky = _command_path("gensky", "RADIANCE_GENSKY_BIN")
+    if not all((oconv, rtrace, gensky)):
+        return {"status": "unavailable", "message": "Radiance tools not found. Set RADIANCE_*_BIN or add Radiance to PATH."}
+    output.mkdir(parents=True, exist_ok=True)
+    scene = output / "site2model.rad"
+    lines = ["# Site2Model geometry generated from OSM footprints"]
+    for index, building in enumerate((model.get("buildings") or [])[:100]):
+        outline = building.get("outline") or []
+        height = max(2.5, min(float(building.get("height_m") or 10), 100))
+        for side, point in enumerate(outline):
+            nxt = outline[(side + 1) % len(outline)]
+            lines += ["void plastic wall", "0", "0", "5 0.55 0.55 0.55 0.0 0.1", f"wall polygon b{index}_{side}", "0", "0", "12", f"{point[0]} {point[1]} 0 {nxt[0]} {nxt[1]} 0 {nxt[0]} {nxt[1]} {height} {point[0]} {point[1]} {height}"]
+    scene.write_text("\n".join(lines), encoding="utf-8")
+    octree = output / "site2model.oct"
+    sky = output / "sky.rad"
+    sky.write_text(subprocess.run([gensky, "6", "21", str(solar_hour)], capture_output=True, text=True, check=False).stdout, encoding="utf-8")
+    try:
+        with octree.open("wb") as handle:
+            compiled = subprocess.run([oconv, str(sky), str(scene)], stdout=handle, stderr=subprocess.PIPE, text=True, timeout=120, check=False)
+        if compiled.returncode != 0:
+            return {"status": "failed", "message": f"Radiance oconv failed: {(compiled.stderr or 'no diagnostic output')[-1600:]}"}
+        probe = subprocess.run([rtrace, "-I+", "-h", str(octree)], input="0 0 2\n", capture_output=True, text=True, timeout=120, check=True)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return {"status": "failed", "message": f"Radiance could not complete: {exc}"}
+    values = probe.stdout.strip().split()
+    return {"status": "completed", "engine": "Radiance", "solar_hour": solar_hour, "probe_rgb": [float(v) for v in values[:3]] if len(values) >= 3 else [], "scene": str(scene)}
+
+
+@app.get("/api/engines")
+def engines():
+    weather_dir = _weather_directory()
+    return {"energyplus": {"available": bool(_command_path("energyplus", "ENERGYPLUS_BIN")), "weather_files": sorted(p.name for p in weather_dir.glob("*.epw")) if weather_dir.exists() else []}, "radiance": {"available": all(_command_path(command, env) for command, env in (("oconv", "RADIANCE_OCONV_BIN"), ("rtrace", "RADIANCE_RTRACE_BIN"), ("gensky", "RADIANCE_GENSKY_BIN")))} }
+
+
+@app.post("/api/weather/download")
+def download_weather(req: WeatherDownloadRequest):
+    """Download the nearest EPW station listed by the Ladybug EPWMap catalog."""
+    return _download_epw_nearest(req.latitude, req.longitude, req.label)
+
+
+@app.put("/api/weather/upload")
+async def upload_weather(request: Request, filename: str = "uploaded.epw"):
+    """Accept an EPW downloaded by the user from EPWMap."""
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename).name)
+    if not safe_name.lower().endswith(".epw"):
+        raise HTTPException(415, "Upload an EnergyPlus .epw weather file")
+    limit = 25 * 1024 * 1024
+    try:
+        declared_size = int(request.headers.get("content-length", "0") or 0)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid Content-Length header") from exc
+    if declared_size > limit:
+        raise HTTPException(413, "EPW file must be smaller than 25 MB")
+    data = await request.body()
+    if len(data) > limit:
+        raise HTTPException(413, "EPW file must be smaller than 25 MB")
+    if not data.startswith(b"LOCATION,"):
+        raise HTTPException(422, "The uploaded file does not look like a valid EPW file")
+    weather_dir = _weather_directory()
+    weather_dir.mkdir(parents=True, exist_ok=True)
+    destination = weather_dir / safe_name
+    destination.write_bytes(data)
+    return {"status": "uploaded", "filename": safe_name, "path": str(destination), "source": "User-uploaded EPW from Ladybug EPWMap"}
+
+
+@app.post("/api/simulate")
+def simulate(req: SimulationRequest):
+    weather = _weather_path(req.weather_file) if req.run_energyplus else None
+    with tempfile.TemporaryDirectory(prefix="site2model-sim-") as temp:
+        output = Path(temp)
+        result = {"status": "completed", "validated": True, "inputs": {"weather_file": weather.name if weather else None, "solar_hour": req.solar_hour}, "energyplus": None, "radiance": None}
+        if req.run_energyplus:
+            if not weather:
+                result["energyplus"] = {"status": "unavailable", "message": "EnergyPlus needs a valid .epw file in WEATHER_EPWS_DIR. Add a weather file and retry."}
+            else:
+                try:
+                    result["energyplus"] = _run_energyplus(req.model, weather, output / "energyplus")
+                except Exception as exc:
+                    result["energyplus"] = {"status": "failed", "message": f"EnergyPlus adapter error: {type(exc).__name__}: {str(exc)[:240]}"}
+        if req.run_radiance:
+            try:
+                result["radiance"] = _run_radiance(req.model, output / "radiance", req.solar_hour)
+            except Exception as exc:
+                result["radiance"] = {"status": "failed", "message": f"Radiance adapter error: {type(exc).__name__}: {str(exc)[:240]}"}
+        if any(item and item.get("status") == "unavailable" for item in (result["energyplus"], result["radiance"])):
+            result["status"] = "unavailable"
+            result["validated"] = False
+        if any(item and item.get("status") == "failed" for item in (result["energyplus"], result["radiance"])):
+            result["status"] = "failed"
+            result["validated"] = False
+        return result
 
 
 @app.post("/api/generate")
@@ -419,11 +806,13 @@ def generate(req: GenerateRequest):
             building["lat"] = round(b_lat, 7)
             building["lon"] = round(b_lon, 7)
     terrain = terrain_grid(lat, lon, req.radius_m, projection, origin_x, origin_y) if req.terrain else {"status": "disabled", "n": 2, "radius_m": req.radius_m, "elevations_m": [0, 0, 0, 0], "datum_min_m": None, "resolution_note": "Terrain layer disabled"}
+    wind = current_wind(lat, lon)
     return {
         "location": {"address": label, "lat": lat, "lon": lon, "radius_m": req.radius_m, "projected_crs": f"EPSG:{epsg}", "local_origin_easting": round(origin_x, 3), "local_origin_northing": round(origin_y, 3)},
         "buildings": buildings,
         "roads": roads,
         "terrain": terrain,
+        "wind": wind,
         "metadata": {"building_count": len(buildings), "road_count": len(roads), "elapsed_s": round(time.monotonic() - start, 2), "osm_status": osm_status, "osm_note": "OpenStreetMap geometry was unavailable; showing the geocoded site without buildings or roads." if osm_status == "unavailable_fallback" else None, "osm_license": "© OpenStreetMap contributors (ODbL)", "limitations": "Building relation multipolygons are not yet handled; untagged heights are unknown, not measured."},
     }
 
