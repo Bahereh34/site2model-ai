@@ -1,0 +1,4 @@
+-r requirements.txt
+# Optional and much larger dependencies; use Python 3.11 or 3.12 for best support.
+torch>=2.3
+transformers>=4.45,<5
